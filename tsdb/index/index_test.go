@@ -30,7 +30,12 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/encoding"
 	"github.com/prometheus/prometheus/util/testutil"
+	"go.uber.org/goleak"
 )
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 type series struct {
 	l      labels.Labels
@@ -453,7 +458,7 @@ func TestPersistence_index_e2e(t *testing.T) {
 	for k, v := range labelPairs {
 		sort.Strings(v)
 
-		res, err := ir.LabelValues(k)
+		res, err := ir.SortedLabelValues(k)
 		testutil.Ok(t, err)
 
 		testutil.Equals(t, len(v), len(res))

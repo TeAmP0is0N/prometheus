@@ -297,10 +297,11 @@ func New(logger log.Logger, o *Options) *Handler {
 		ready: 0,
 	}
 
-	factoryTr := func(_ context.Context) api_v1.TargetRetriever {
-		return h.scrapeManager
-	}
-	h.apiV1 = api_v1.NewAPI(h.queryEngine, h.storage, factoryTr, h.notifier,
+	factoryTr := func(_ context.Context) api_v1.TargetRetriever { return h.scrapeManager }
+	factoryAr := func(_ context.Context) api_v1.AlertmanagerRetriever { return h.notifier }
+	FactoryRr := func(_ context.Context) api_v1.RulesRetriever { return h.ruleManager }
+
+	h.apiV1 = api_v1.NewAPI(h.queryEngine, h.storage, factoryTr, factoryAr,
 		func() config.Config {
 			h.mtx.RLock()
 			defer h.mtx.RUnlock()
@@ -317,7 +318,7 @@ func New(logger log.Logger, o *Options) *Handler {
 		h.options.TSDBDir,
 		h.options.EnableAdminAPI,
 		logger,
-		h.ruleManager,
+		FactoryRr,
 		h.options.RemoteReadSampleLimit,
 		h.options.RemoteReadConcurrencyLimit,
 		h.options.RemoteReadBytesInFrame,
@@ -395,9 +396,10 @@ func New(logger log.Logger, o *Options) *Handler {
 				fmt.Fprintf(w, "Error reading React index.html: %v", err)
 				return
 			}
-			prefixedIdx := bytes.ReplaceAll(idx, []byte("PATH_PREFIX_PLACEHOLDER"), []byte(o.ExternalURL.Path))
-			prefixedIdx = bytes.ReplaceAll(prefixedIdx, []byte("CONSOLES_LINK_PLACEHOLDER"), []byte(h.consolesPath()))
-			w.Write(prefixedIdx)
+			replacedIdx := bytes.ReplaceAll(idx, []byte("PATH_PREFIX_PLACEHOLDER"), []byte(o.ExternalURL.Path))
+			replacedIdx = bytes.ReplaceAll(replacedIdx, []byte("CONSOLES_LINK_PLACEHOLDER"), []byte(h.consolesPath()))
+			replacedIdx = bytes.ReplaceAll(replacedIdx, []byte("TITLE_PLACEHOLDER"), []byte(h.options.PageTitle))
+			w.Write(replacedIdx)
 			return
 		}
 
@@ -980,6 +982,10 @@ func tmplFuncs(consolesPath string, opts *Options) template_text.FuncMap {
 	return template_text.FuncMap{
 		"since": func(t time.Time) time.Duration {
 			return time.Since(t) / time.Millisecond * time.Millisecond
+		},
+		"unixToTime": func(i int64) time.Time {
+			t := time.Unix(i/int64(time.Microsecond), 0).UTC()
+			return t
 		},
 		"consolesPath": func() string { return consolesPath },
 		"pathPrefix":   func() string { return opts.ExternalURL.Path },

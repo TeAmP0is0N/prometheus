@@ -30,6 +30,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -204,7 +205,7 @@ func main() {
 	a.Flag("storage.tsdb.retention.time", "How long to retain samples in storage. When this flag is set it overrides \"storage.tsdb.retention\". If neither this flag nor \"storage.tsdb.retention\" nor \"storage.tsdb.retention.size\" is set, the retention time defaults to "+defaultRetentionString+". Units Supported: y, w, d, h, m, s, ms.").
 		SetValue(&newFlagRetentionDuration)
 
-	a.Flag("storage.tsdb.retention.size", "[EXPERIMENTAL] Maximum number of bytes that can be stored for blocks. Units supported: KB, MB, GB, TB, PB. This flag is experimental and can be changed in future releases.").
+	a.Flag("storage.tsdb.retention.size", "[EXPERIMENTAL] Maximum number of bytes that can be stored for blocks. A unit is required, supported units: B, KB, MB, GB, TB, PB, EB. Ex: \"512MB\". This flag is experimental and can be changed in future releases.").
 		BytesVar(&cfg.tsdb.MaxBytes)
 
 	a.Flag("storage.tsdb.no-lockfile", "Do not create lockfile in data directory.").
@@ -214,7 +215,7 @@ func main() {
 		Default("false").BoolVar(&cfg.tsdb.AllowOverlappingBlocks)
 
 	a.Flag("storage.tsdb.wal-compression", "Compress the tsdb WAL.").
-		Default("false").BoolVar(&cfg.tsdb.WALCompression)
+		Default("true").BoolVar(&cfg.tsdb.WALCompression)
 
 	a.Flag("storage.remote.flush-deadline", "How long to wait flushing sample on shutdown or config reload.").
 		Default("1m").PlaceHolder("<duration>").SetValue(&cfg.RemoteFlushDeadline)
@@ -278,6 +279,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Throw error for invalid config before starting other components.
+	if _, err := config.LoadFile(cfg.configFile); err != nil {
+		level.Error(logger).Log("msg", fmt.Sprintf("Error loading config (--config.file=%s)", cfg.configFile), "err", err)
+		os.Exit(2)
+	}
+
 	cfg.web.ReadTimeout = time.Duration(cfg.webTimeout)
 	// Default -web.route-prefix to path of -web.external-url.
 	if cfg.web.RoutePrefix == "" {
@@ -328,7 +335,8 @@ func main() {
 		}
 	}
 
-	promql.SetDefaultEvaluationInterval(time.Duration(config.DefaultGlobalConfig.EvaluationInterval))
+	noStepSubqueryInterval := &safePromQLNoStepSubqueryInterval{}
+	noStepSubqueryInterval.Set(config.DefaultGlobalConfig.EvaluationInterval)
 
 	// Above level 6, the k8s client would log bearer tokens in clear-text.
 	klog.ClampLevel(6)
@@ -361,19 +369,20 @@ func main() {
 		scrapeManager = scrape.NewManager(log.With(logger, "component", "scrape manager"), fanoutStorage)
 
 		opts = promql.EngineOpts{
-			Logger:             log.With(logger, "component", "query engine"),
-			Reg:                prometheus.DefaultRegisterer,
-			MaxSamples:         cfg.queryMaxSamples,
-			Timeout:            time.Duration(cfg.queryTimeout),
-			ActiveQueryTracker: promql.NewActiveQueryTracker(cfg.localStoragePath, cfg.queryConcurrency, log.With(logger, "component", "activeQueryTracker")),
-			LookbackDelta:      time.Duration(cfg.lookbackDelta),
+			Logger:                   log.With(logger, "component", "query engine"),
+			Reg:                      prometheus.DefaultRegisterer,
+			MaxSamples:               cfg.queryMaxSamples,
+			Timeout:                  time.Duration(cfg.queryTimeout),
+			ActiveQueryTracker:       promql.NewActiveQueryTracker(cfg.localStoragePath, cfg.queryConcurrency, log.With(logger, "component", "activeQueryTracker")),
+			LookbackDelta:            time.Duration(cfg.lookbackDelta),
+			NoStepSubqueryIntervalFn: noStepSubqueryInterval.Get,
 		}
 
 		queryEngine = promql.NewEngine(opts)
 
 		ruleManager = rules.NewManager(&rules.ManagerOptions{
 			Appendable:      fanoutStorage,
-			TSDB:            localStorage,
+			Queryable:       localStorage,
 			QueryFunc:       rules.EngineQueryFunc(queryEngine, fanoutStorage),
 			NotifyFunc:      sendAlerts(notifierManager, cfg.web.ExternalURL.String()),
 			Context:         ctxRule,
@@ -600,11 +609,11 @@ func main() {
 				for {
 					select {
 					case <-hup:
-						if err := reloadConfig(cfg.configFile, logger, reloaders...); err != nil {
+						if err := reloadConfig(cfg.configFile, logger, noStepSubqueryInterval, reloaders...); err != nil {
 							level.Error(logger).Log("msg", "Error reloading config", "err", err)
 						}
 					case rc := <-webHandler.Reload():
-						if err := reloadConfig(cfg.configFile, logger, reloaders...); err != nil {
+						if err := reloadConfig(cfg.configFile, logger, noStepSubqueryInterval, reloaders...); err != nil {
 							level.Error(logger).Log("msg", "Error reloading config", "err", err)
 							rc <- err
 						} else {
@@ -636,7 +645,7 @@ func main() {
 					return nil
 				}
 
-				if err := reloadConfig(cfg.configFile, logger, reloaders...); err != nil {
+				if err := reloadConfig(cfg.configFile, logger, noStepSubqueryInterval, reloaders...); err != nil {
 					return errors.Wrapf(err, "error loading config from %q", cfg.configFile)
 				}
 
@@ -654,18 +663,14 @@ func main() {
 	}
 	{
 		// Rule manager.
-		// TODO(krasi) refactor ruleManager.Run() to be blocking to avoid using an extra blocking channel.
-		cancel := make(chan struct{})
 		g.Add(
 			func() error {
 				<-reloadReady.C
 				ruleManager.Run()
-				<-cancel
 				return nil
 			},
 			func(err error) {
 				ruleManager.Stop()
-				close(cancel)
 			},
 		)
 	}
@@ -795,7 +800,22 @@ func openDBWithMetrics(dir string, logger log.Logger, reg prometheus.Registerer,
 	return db, nil
 }
 
-func reloadConfig(filename string, logger log.Logger, rls ...func(*config.Config) error) (err error) {
+type safePromQLNoStepSubqueryInterval struct {
+	value int64
+}
+
+func durationToInt64Millis(d time.Duration) int64 {
+	return int64(d / time.Millisecond)
+}
+func (i *safePromQLNoStepSubqueryInterval) Set(ev model.Duration) {
+	atomic.StoreInt64(&i.value, durationToInt64Millis(time.Duration(ev)))
+}
+
+func (i *safePromQLNoStepSubqueryInterval) Get(int64) int64 {
+	return atomic.LoadInt64(&i.value)
+}
+
+func reloadConfig(filename string, logger log.Logger, noStepSuqueryInterval *safePromQLNoStepSubqueryInterval, rls ...func(*config.Config) error) (err error) {
 	level.Info(logger).Log("msg", "Loading configuration file", "filename", filename)
 
 	defer func() {
@@ -823,7 +843,7 @@ func reloadConfig(filename string, logger log.Logger, rls ...func(*config.Config
 		return errors.Errorf("one or more errors occurred while applying the new configuration (--config.file=%q)", filename)
 	}
 
-	promql.SetDefaultEvaluationInterval(time.Duration(conf.GlobalConfig.EvaluationInterval))
+	noStepSuqueryInterval.Set(conf.GlobalConfig.EvaluationInterval)
 	level.Info(logger).Log("msg", "Completed loading of configuration file", "filename", filename)
 	return nil
 }
@@ -951,6 +971,14 @@ func (s *readyStorage) StartTime() (int64, error) {
 func (s *readyStorage) Querier(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
 	if x := s.get(); x != nil {
 		return x.Querier(ctx, mint, maxt)
+	}
+	return nil, tsdb.ErrNotReady
+}
+
+// ChunkQuerier implements the Storage interface.
+func (s *readyStorage) ChunkQuerier(ctx context.Context, mint, maxt int64) (storage.ChunkQuerier, error) {
+	if x := s.get(); x != nil {
+		return x.ChunkQuerier(ctx, mint, maxt)
 	}
 	return nil, tsdb.ErrNotReady
 }

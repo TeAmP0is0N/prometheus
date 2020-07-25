@@ -139,7 +139,7 @@ to the nearest integer.
 
 ## `histogram_quantile()`
 
-`histogram_quantile(φ float, b instant-vector)` calculates the φ-quantile (0 ≤ φ
+`histogram_quantile(φ scalar, b instant-vector)` calculates the φ-quantile (0 ≤ φ
 ≤ 1) from the buckets `b` of a
 [histogram](https://prometheus.io/docs/concepts/metric_types/#histogram). (See
 [histograms and summaries](https://prometheus.io/docs/practices/histograms) for
@@ -182,8 +182,8 @@ is assumed to be 0 if the upper bound of that bucket is greater than
 bucket. Otherwise, the upper bound of the lowest bucket is returned
 for quantiles located in the lowest bucket.
 
-If `b` contains fewer than two buckets, `NaN` is returned. For φ < 0, `-Inf` is
-returned. For φ > 1, `+Inf` is returned.
+If `b` has 0 observations, `NaN` is returned. If `b` contains fewer than two buckets,
+`NaN` is returned. For φ < 0, `-Inf` is returned. For φ > 1, `+Inf` is returned.
 
 ## `holt_winters()`
 

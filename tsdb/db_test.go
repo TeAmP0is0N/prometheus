@@ -14,6 +14,7 @@
 package tsdb
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -45,9 +46,14 @@ import (
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	"github.com/prometheus/prometheus/tsdb/wal"
 	"github.com/prometheus/prometheus/util/testutil"
+	"go.uber.org/goleak"
 )
 
-func openTestDB(t testing.TB, opts *Options, rngs []int64) (db *DB, close func()) {
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
+
+func openTestDB(t testing.TB, opts *Options, rngs []int64) (db *DB) {
 	tmpdir, err := ioutil.TempDir("", "test")
 	testutil.Ok(t, err)
 
@@ -59,23 +65,21 @@ func openTestDB(t testing.TB, opts *Options, rngs []int64) (db *DB, close func()
 	}
 	testutil.Ok(t, err)
 
-	// Do not close the test database by default as it will deadlock on test failures.
-	return db, func() {
+	// Do not Close() the test database by default as it will deadlock on test failures.
+	t.Cleanup(func() {
 		testutil.Ok(t, os.RemoveAll(tmpdir))
-	}
+	})
+	return db
 }
 
 // query runs a matcher query against the querier and fully expands its data.
 func query(t testing.TB, q storage.Querier, matchers ...*labels.Matcher) map[string][]tsdbutil.Sample {
-	ss, ws, err := q.Select(false, nil, matchers...)
+	ss := q.Select(false, nil, matchers...)
 	defer func() {
 		testutil.Ok(t, q.Close())
 	}()
-	testutil.Ok(t, err)
-	testutil.Equals(t, 0, len(ws))
 
 	result := map[string][]tsdbutil.Sample{}
-
 	for ss.Next() {
 		series := ss.At()
 
@@ -95,6 +99,7 @@ func query(t testing.TB, q storage.Querier, matchers ...*labels.Matcher) map[str
 		result[name] = samples
 	}
 	testutil.Ok(t, ss.Err())
+	testutil.Equals(t, 0, len(ss.Warnings()))
 
 	return result
 }
@@ -102,10 +107,9 @@ func query(t testing.TB, q storage.Querier, matchers ...*labels.Matcher) map[str
 // Ensure that blocks are held in memory in their time order
 // and not in ULID order as they are read from the directory.
 func TestDB_reloadOrder(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	metas := []BlockMeta{
@@ -129,10 +133,9 @@ func TestDB_reloadOrder(t *testing.T) {
 }
 
 func TestDataAvailableOnlyAfterCommit(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	app := db.Appender()
@@ -157,11 +160,70 @@ func TestDataAvailableOnlyAfterCommit(t *testing.T) {
 	testutil.Equals(t, map[string][]tsdbutil.Sample{`{foo="bar"}`: {sample{t: 0, v: 0}}}, seriesSet)
 }
 
+// TestNoPanicAfterWALCorrutpion ensures that querying the db after a WAL corruption doesn't cause a panic.
+// https://github.com/prometheus/prometheus/issues/7548
+func TestNoPanicAfterWALCorrutpion(t *testing.T) {
+	db := openTestDB(t, &Options{WALSegmentSize: 32 * 1024}, nil)
+
+	// Append until the the first mmaped head chunk.
+	// This is to ensure that all samples can be read from the mmaped chunks when the WAL is corrupted.
+	var expSamples []tsdbutil.Sample
+	var maxt int64
+	{
+		for {
+			app := db.Appender()
+			_, err := app.Add(labels.FromStrings("foo", "bar"), maxt, 0)
+			expSamples = append(expSamples, sample{t: maxt, v: 0})
+			testutil.Ok(t, err)
+			testutil.Ok(t, app.Commit())
+			mmapedChunks, err := ioutil.ReadDir(mmappedChunksDir(db.Dir()))
+			testutil.Ok(t, err)
+			if len(mmapedChunks) > 0 {
+				break
+			}
+			maxt++
+		}
+		testutil.Ok(t, db.Close())
+	}
+
+	// Corrupt the WAL after the first sample of the series so that it has at least one sample and
+	// it is not garbage collected.
+	// The repair deletes all WAL records after the corrupted record and these are read from the mmaped chunk.
+	{
+		walFiles, err := ioutil.ReadDir(path.Join(db.Dir(), "wal"))
+		testutil.Ok(t, err)
+		f, err := os.OpenFile(path.Join(db.Dir(), "wal", walFiles[0].Name()), os.O_RDWR, 0666)
+		testutil.Ok(t, err)
+		r := wal.NewReader(bufio.NewReader(f))
+		testutil.Assert(t, r.Next(), "reading the series record")
+		testutil.Assert(t, r.Next(), "reading the first sample record")
+		// Write an invalid record header to corrupt everything after the first wal sample.
+		_, err = f.WriteAt([]byte{99}, r.Offset())
+		testutil.Ok(t, err)
+		f.Close()
+	}
+
+	// Query the data.
+	{
+		db, err := Open(db.Dir(), nil, nil, nil)
+		testutil.Ok(t, err)
+		defer func() {
+			testutil.Ok(t, db.Close())
+		}()
+		testutil.Equals(t, 1.0, prom_testutil.ToFloat64(db.head.metrics.walCorruptionsTotal), "WAL corruption count mismatch")
+
+		querier, err := db.Querier(context.TODO(), 0, maxt)
+		testutil.Ok(t, err)
+		seriesSet := query(t, querier, labels.MustNewMatcher(labels.MatchEqual, "", ""))
+		// The last sample should be missing as it was after the WAL segment corruption.
+		testutil.Equals(t, map[string][]tsdbutil.Sample{`{foo="bar"}`: expSamples[0 : len(expSamples)-1]}, seriesSet)
+	}
+}
+
 func TestDataNotAvailableAfterRollback(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	app := db.Appender()
@@ -181,10 +243,9 @@ func TestDataNotAvailableAfterRollback(t *testing.T) {
 }
 
 func TestDBAppenderAddRef(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	app1 := db.Appender()
@@ -236,10 +297,9 @@ func TestDBAppenderAddRef(t *testing.T) {
 }
 
 func TestAppendEmptyLabelsIgnored(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	app1 := db.Appender()
@@ -289,10 +349,9 @@ func TestDeleteSimple(t *testing.T) {
 
 Outer:
 	for _, c := range cases {
-		db, closeFn := openTestDB(t, nil, nil)
+		db := openTestDB(t, nil, nil)
 		defer func() {
 			testutil.Ok(t, db.Close())
-			closeFn()
 		}()
 
 		app := db.Appender()
@@ -315,9 +374,7 @@ Outer:
 		q, err := db.Querier(context.TODO(), 0, numSamples)
 		testutil.Ok(t, err)
 
-		res, ws, err := q.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "a", "b"))
-		testutil.Ok(t, err)
-		testutil.Equals(t, 0, len(ws))
+		res := q.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "a", "b"))
 
 		expSamples := make([]tsdbutil.Sample, 0, len(c.remaint))
 		for _, ts := range c.remaint {
@@ -333,6 +390,7 @@ Outer:
 			testutil.Equals(t, eok, rok)
 
 			if !eok {
+				testutil.Equals(t, 0, len(res.Warnings()))
 				continue Outer
 			}
 			sexp := expss.At()
@@ -350,10 +408,9 @@ Outer:
 }
 
 func TestAmendDatapointCausesError(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	app := db.Appender()
@@ -368,10 +425,9 @@ func TestAmendDatapointCausesError(t *testing.T) {
 }
 
 func TestDuplicateNaNDatapointNoAmendError(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	app := db.Appender()
@@ -385,10 +441,9 @@ func TestDuplicateNaNDatapointNoAmendError(t *testing.T) {
 }
 
 func TestNonDuplicateNaNDatapointsCausesAmendError(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	app := db.Appender()
@@ -402,10 +457,9 @@ func TestNonDuplicateNaNDatapointsCausesAmendError(t *testing.T) {
 }
 
 func TestEmptyLabelsetCausesError(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	app := db.Appender()
@@ -415,10 +469,9 @@ func TestEmptyLabelsetCausesError(t *testing.T) {
 }
 
 func TestSkippingInvalidValuesInSameTxn(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	// Append AmendedValue.
@@ -458,8 +511,7 @@ func TestSkippingInvalidValuesInSameTxn(t *testing.T) {
 }
 
 func TestDB_Snapshot(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
-	defer closeFn()
+	db := openTestDB(t, nil, nil)
 
 	// append data
 	app := db.Appender()
@@ -469,7 +521,6 @@ func TestDB_Snapshot(t *testing.T) {
 		testutil.Ok(t, err)
 	}
 	testutil.Ok(t, app.Commit())
-	testutil.Ok(t, app.Rollback())
 
 	// create snapshot
 	snap, err := ioutil.TempDir("", "snap")
@@ -491,10 +542,7 @@ func TestDB_Snapshot(t *testing.T) {
 	defer func() { testutil.Ok(t, querier.Close()) }()
 
 	// sum values
-	seriesSet, ws, err := querier.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
-	testutil.Ok(t, err)
-	testutil.Equals(t, 0, len(ws))
-
+	seriesSet := querier.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
 	sum := 0.0
 	for seriesSet.Next() {
 		series := seriesSet.At().Iterator()
@@ -505,6 +553,7 @@ func TestDB_Snapshot(t *testing.T) {
 		testutil.Ok(t, series.Err())
 	}
 	testutil.Ok(t, seriesSet.Err())
+	testutil.Equals(t, 0, len(seriesSet.Warnings()))
 	testutil.Equals(t, 1000.0, sum)
 }
 
@@ -512,8 +561,7 @@ func TestDB_Snapshot(t *testing.T) {
 // that are outside the set block time range.
 // See https://github.com/prometheus/prometheus/issues/5105
 func TestDB_Snapshot_ChunksOutsideOfCompactedRange(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
-	defer closeFn()
+	db := openTestDB(t, nil, nil)
 
 	app := db.Appender()
 	mint := int64(1414141414000)
@@ -522,7 +570,6 @@ func TestDB_Snapshot_ChunksOutsideOfCompactedRange(t *testing.T) {
 		testutil.Ok(t, err)
 	}
 	testutil.Ok(t, app.Commit())
-	testutil.Ok(t, app.Rollback())
 
 	snap, err := ioutil.TempDir("", "snap")
 	testutil.Ok(t, err)
@@ -546,10 +593,7 @@ func TestDB_Snapshot_ChunksOutsideOfCompactedRange(t *testing.T) {
 	defer func() { testutil.Ok(t, querier.Close()) }()
 
 	// Sum values.
-	seriesSet, ws, err := querier.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
-	testutil.Ok(t, err)
-	testutil.Equals(t, 0, len(ws))
-
+	seriesSet := querier.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
 	sum := 0.0
 	for seriesSet.Next() {
 		series := seriesSet.At().Iterator()
@@ -560,6 +604,7 @@ func TestDB_Snapshot_ChunksOutsideOfCompactedRange(t *testing.T) {
 		testutil.Ok(t, series.Err())
 	}
 	testutil.Ok(t, seriesSet.Err())
+	testutil.Equals(t, 0, len(seriesSet.Warnings()))
 
 	// Since we snapshotted with MaxTime - 10, so expect 10 less samples.
 	testutil.Equals(t, 1000.0-10, sum)
@@ -568,8 +613,7 @@ func TestDB_Snapshot_ChunksOutsideOfCompactedRange(t *testing.T) {
 func TestDB_SnapshotWithDelete(t *testing.T) {
 	numSamples := int64(10)
 
-	db, closeFn := openTestDB(t, nil, nil)
-	defer closeFn()
+	db := openTestDB(t, nil, nil)
 
 	app := db.Appender()
 
@@ -618,9 +662,7 @@ Outer:
 		testutil.Ok(t, err)
 		defer func() { testutil.Ok(t, q.Close()) }()
 
-		res, ws, err := q.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "a", "b"))
-		testutil.Ok(t, err)
-		testutil.Equals(t, 0, len(ws))
+		res := q.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "a", "b"))
 
 		expSamples := make([]tsdbutil.Sample, 0, len(c.remaint))
 		for _, ts := range c.remaint {
@@ -641,6 +683,7 @@ Outer:
 			testutil.Equals(t, eok, rok)
 
 			if !eok {
+				testutil.Equals(t, 0, len(res.Warnings()))
 				continue Outer
 			}
 			sexp := expss.At()
@@ -712,10 +755,9 @@ func TestDB_e2e(t *testing.T) {
 		seriesMap[labels.New(l...).String()] = []tsdbutil.Sample{}
 	}
 
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	app := db.Appender()
@@ -792,10 +834,7 @@ func TestDB_e2e(t *testing.T) {
 			q, err := db.Querier(context.TODO(), mint, maxt)
 			testutil.Ok(t, err)
 
-			ss, ws, err := q.Select(false, nil, qry.ms...)
-			testutil.Ok(t, err)
-			testutil.Equals(t, 0, len(ws))
-
+			ss := q.Select(false, nil, qry.ms...)
 			result := map[string][]tsdbutil.Sample{}
 
 			for ss.Next() {
@@ -810,6 +849,7 @@ func TestDB_e2e(t *testing.T) {
 			}
 
 			testutil.Ok(t, ss.Err())
+			testutil.Equals(t, 0, len(ss.Warnings()))
 			testutil.Equals(t, expected, result)
 
 			q.Close()
@@ -818,8 +858,7 @@ func TestDB_e2e(t *testing.T) {
 }
 
 func TestWALFlushedOnDBClose(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
-	defer closeFn()
+	db := openTestDB(t, nil, nil)
 
 	dirDb := db.Dir()
 
@@ -896,13 +935,16 @@ func TestWALSegmentSizeOptions(t *testing.T) {
 		t.Run(fmt.Sprintf("WALSegmentSize %d test", segmentSize), func(t *testing.T) {
 			opts := DefaultOptions()
 			opts.WALSegmentSize = segmentSize
-			db, closeFn := openTestDB(t, opts, nil)
-			defer closeFn()
+			db := openTestDB(t, opts, nil)
 
-			app := db.Appender()
 			for i := int64(0); i < 155; i++ {
-				_, err := app.Add(labels.Labels{labels.Label{Name: "wal", Value: "size"}}, i, rand.Float64())
+				app := db.Appender()
+				ref, err := app.Add(labels.Labels{labels.Label{Name: "wal" + fmt.Sprintf("%d", i), Value: "size"}}, i, rand.Float64())
 				testutil.Ok(t, err)
+				for j := int64(1); j <= 78; j++ {
+					err := app.AddFast(ref, i+j, rand.Float64())
+					testutil.Ok(t, err)
+				}
 				testutil.Ok(t, app.Commit())
 			}
 
@@ -916,8 +958,7 @@ func TestWALSegmentSizeOptions(t *testing.T) {
 func TestTombstoneClean(t *testing.T) {
 	numSamples := int64(10)
 
-	db, closeFn := openTestDB(t, nil, nil)
-	defer closeFn()
+	db := openTestDB(t, nil, nil)
 
 	app := db.Appender()
 
@@ -968,9 +1009,7 @@ func TestTombstoneClean(t *testing.T) {
 		testutil.Ok(t, err)
 		defer q.Close()
 
-		res, ws, err := q.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "a", "b"))
-		testutil.Ok(t, err)
-		testutil.Equals(t, 0, len(ws))
+		res := q.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "a", "b"))
 
 		expSamples := make([]tsdbutil.Sample, 0, len(c.remaint))
 		for _, ts := range c.remaint {
@@ -1004,6 +1043,7 @@ func TestTombstoneClean(t *testing.T) {
 			testutil.Equals(t, errExp, errRes)
 			testutil.Equals(t, smplExp, smplRes)
 		}
+		testutil.Equals(t, 0, len(res.Warnings()))
 
 		for _, b := range db.Blocks() {
 			testutil.Equals(t, tombstones.NewMemTombstones(), b.tombstones)
@@ -1015,10 +1055,9 @@ func TestTombstoneClean(t *testing.T) {
 // When TombstoneClean errors the original block that should be rebuilt doesn't get deleted so
 // if TombstoneClean leaves any blocks behind these will overlap.
 func TestTombstoneCleanFail(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	var expectedBlockDirs []string
@@ -1095,10 +1134,9 @@ func (*mockCompactorFailing) Compact(string, []string, []*Block) (ulid.ULID, err
 }
 
 func TestTimeRetention(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, []int64{1000})
+	db := openTestDB(t, nil, []int64{1000})
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	blocks := []*BlockMeta{
@@ -1127,10 +1165,9 @@ func TestTimeRetention(t *testing.T) {
 }
 
 func TestSizeRetention(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, []int64{100})
+	db := openTestDB(t, nil, []int64{100})
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	blocks := []*BlockMeta{
@@ -1180,7 +1217,7 @@ func TestSizeRetention(t *testing.T) {
 	// Create a WAL checkpoint, and compare sizes.
 	first, last, err := db.Head().wal.Segments()
 	testutil.Ok(t, err)
-	_, err = wal.Checkpoint(db.Head().wal, first, last-1, func(x uint64) bool { return false }, 0)
+	_, err = wal.Checkpoint(log.NewNopLogger(), db.Head().wal, first, last-1, func(x uint64) bool { return false }, 0)
 	testutil.Ok(t, err)
 	blockSize = int64(prom_testutil.ToFloat64(db.metrics.blocksBytes)) // Use the actual internal metrics.
 	walSize, err = db.Head().wal.Size()
@@ -1227,12 +1264,11 @@ func TestSizeRetentionMetric(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		db, closeFn := openTestDB(t, &Options{
+		db := openTestDB(t, &Options{
 			MaxBytes: c.maxBytes,
 		}, []int64{100})
 		defer func() {
 			testutil.Ok(t, db.Close())
-			closeFn()
 		}()
 
 		actMaxBytes := int64(prom_testutil.ToFloat64(db.metrics.maxBytes))
@@ -1241,10 +1277,9 @@ func TestSizeRetentionMetric(t *testing.T) {
 }
 
 func TestNotMatcherSelectsLabelsUnsetSeries(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	labelpairs := []labels.Labels{
@@ -1306,19 +1341,17 @@ func TestNotMatcherSelectsLabelsUnsetSeries(t *testing.T) {
 	defer func() { testutil.Ok(t, q.Close()) }()
 
 	for _, c := range cases {
-		ss, ws, err := q.Select(false, nil, c.selector...)
+		ss := q.Select(false, nil, c.selector...)
+		lres, _, ws, err := expandSeriesSet(ss)
 		testutil.Ok(t, err)
 		testutil.Equals(t, 0, len(ws))
-
-		lres, _, err := expandSeriesSet(ss)
-		testutil.Ok(t, err)
 		testutil.Equals(t, c.series, lres)
 	}
 }
 
 // expandSeriesSet returns the raw labels in the order they are retrieved from
 // the series set and the samples keyed by Labels().String().
-func expandSeriesSet(ss storage.SeriesSet) ([]labels.Labels, map[string][]sample, error) {
+func expandSeriesSet(ss storage.SeriesSet) ([]labels.Labels, map[string][]sample, storage.Warnings, error) {
 	resultLabels := []labels.Labels{}
 	resultSamples := map[string][]sample{}
 	for ss.Next() {
@@ -1332,7 +1365,7 @@ func expandSeriesSet(ss storage.SeriesSet) ([]labels.Labels, map[string][]sample
 		resultLabels = append(resultLabels, series.Labels())
 		resultSamples[series.Labels().String()] = samples
 	}
-	return resultLabels, resultSamples, ss.Err()
+	return resultLabels, resultSamples, ss.Warnings(), ss.Err()
 }
 
 func TestOverlappingBlocksDetectsAllOverlaps(t *testing.T) {
@@ -1429,10 +1462,9 @@ func TestOverlappingBlocksDetectsAllOverlaps(t *testing.T) {
 
 // Regression test for https://github.com/prometheus/tsdb/issues/347
 func TestChunkAtBlockBoundary(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	app := db.Appender()
@@ -1486,10 +1518,9 @@ func TestChunkAtBlockBoundary(t *testing.T) {
 }
 
 func TestQuerierWithBoundaryChunks(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	app := db.Appender()
@@ -1637,10 +1668,9 @@ func TestInitializeHeadTimestamp(t *testing.T) {
 }
 
 func TestNoEmptyBlocks(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, []int64{100})
+	db := openTestDB(t, nil, []int64{100})
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 	db.DisableCompactions()
 
@@ -1795,10 +1825,9 @@ func TestDB_LabelNames(t *testing.T) {
 		testutil.Ok(t, err)
 	}
 	for _, tst := range tests {
-		db, closeFn := openTestDB(t, nil, nil)
+		db := openTestDB(t, nil, nil)
 		defer func() {
 			testutil.Ok(t, db.Close())
-			closeFn()
 		}()
 
 		appendSamples(db, 0, 4, tst.sampleLabels1)
@@ -1842,10 +1871,9 @@ func TestDB_LabelNames(t *testing.T) {
 }
 
 func TestCorrectNumTombstones(t *testing.T) {
-	db, closeFn := openTestDB(t, nil, nil)
+	db := openTestDB(t, nil, nil)
 	defer func() {
 		testutil.Ok(t, db.Close())
-		closeFn()
 	}()
 
 	blockRange := db.compactor.(*LeveledCompactor).ranges[0]
@@ -2299,6 +2327,7 @@ func TestBlockRanges(t *testing.T) {
 
 	// Test that wal records are skipped when an existing block covers the same time ranges
 	// and compaction doesn't create an overlapping block.
+	app = db.Appender()
 	db.DisableCompactions()
 	_, err = app.Add(lbl, secondBlockMaxt+1, rand.Float64())
 	testutil.Ok(t, err)
@@ -2503,9 +2532,7 @@ func TestDBReadOnly_FlushWAL(t *testing.T) {
 	defer func() { testutil.Ok(t, querier.Close()) }()
 
 	// Sum the values.
-	seriesSet, ws, err := querier.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, defaultLabelName, "flush"))
-	testutil.Ok(t, err)
-	testutil.Equals(t, 0, len(ws))
+	seriesSet := querier.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, defaultLabelName, "flush"))
 
 	sum := 0.0
 	for seriesSet.Next() {
@@ -2517,12 +2544,15 @@ func TestDBReadOnly_FlushWAL(t *testing.T) {
 		testutil.Ok(t, series.Err())
 	}
 	testutil.Ok(t, seriesSet.Err())
+	testutil.Equals(t, 0, len(seriesSet.Warnings()))
 	testutil.Equals(t, 1000.0, sum)
 }
 
 func TestDBCannotSeePartialCommits(t *testing.T) {
 	tmpdir, _ := ioutil.TempDir("", "test")
-	defer os.RemoveAll(tmpdir)
+	defer func() {
+		testutil.Ok(t, os.RemoveAll(tmpdir))
+	}()
 
 	db, err := Open(tmpdir, nil, nil, nil)
 	testutil.Ok(t, err)
@@ -2568,11 +2598,11 @@ func TestDBCannotSeePartialCommits(t *testing.T) {
 			testutil.Ok(t, err)
 			defer querier.Close()
 
-			ss, _, err := querier.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+			ss := querier.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+			_, seriesSet, ws, err := expandSeriesSet(ss)
 			testutil.Ok(t, err)
+			testutil.Equals(t, 0, len(ws))
 
-			_, seriesSet, err := expandSeriesSet(ss)
-			testutil.Ok(t, err)
 			values := map[float64]struct{}{}
 			for _, series := range seriesSet {
 				values[series[len(series)-1].v] = struct{}{}
@@ -2589,7 +2619,9 @@ func TestDBCannotSeePartialCommits(t *testing.T) {
 
 func TestDBQueryDoesntSeeAppendsAfterCreation(t *testing.T) {
 	tmpdir, _ := ioutil.TempDir("", "test")
-	defer os.RemoveAll(tmpdir)
+	defer func() {
+		testutil.Ok(t, os.RemoveAll(tmpdir))
+	}()
 
 	db, err := Open(tmpdir, nil, nil, nil)
 	testutil.Ok(t, err)
@@ -2608,16 +2640,16 @@ func TestDBQueryDoesntSeeAppendsAfterCreation(t *testing.T) {
 	defer querierAfterAddButBeforeCommit.Close()
 
 	// None of the queriers should return anything after the Add but before the commit.
-	ss, _, err := querierBeforeAdd.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+	ss := querierBeforeAdd.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+	_, seriesSet, ws, err := expandSeriesSet(ss)
 	testutil.Ok(t, err)
-	_, seriesSet, err := expandSeriesSet(ss)
-	testutil.Ok(t, err)
+	testutil.Equals(t, 0, len(ws))
 	testutil.Equals(t, map[string][]sample{}, seriesSet)
 
-	ss, _, err = querierAfterAddButBeforeCommit.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+	ss = querierAfterAddButBeforeCommit.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+	_, seriesSet, ws, err = expandSeriesSet(ss)
 	testutil.Ok(t, err)
-	_, seriesSet, err = expandSeriesSet(ss)
-	testutil.Ok(t, err)
+	testutil.Equals(t, 0, len(ws))
 	testutil.Equals(t, map[string][]sample{}, seriesSet)
 
 	// This commit is after the queriers are created, so should not be returned.
@@ -2625,17 +2657,17 @@ func TestDBQueryDoesntSeeAppendsAfterCreation(t *testing.T) {
 	testutil.Ok(t, err)
 
 	// Nothing returned for querier created before the Add.
-	ss, _, err = querierBeforeAdd.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+	ss = querierBeforeAdd.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+	_, seriesSet, ws, err = expandSeriesSet(ss)
 	testutil.Ok(t, err)
-	_, seriesSet, err = expandSeriesSet(ss)
-	testutil.Ok(t, err)
+	testutil.Equals(t, 0, len(ws))
 	testutil.Equals(t, map[string][]sample{}, seriesSet)
 
 	// Series exists but has no samples for querier created after Add.
-	ss, _, err = querierAfterAddButBeforeCommit.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+	ss = querierAfterAddButBeforeCommit.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+	_, seriesSet, ws, err = expandSeriesSet(ss)
 	testutil.Ok(t, err)
-	_, seriesSet, err = expandSeriesSet(ss)
-	testutil.Ok(t, err)
+	testutil.Equals(t, 0, len(ws))
 	testutil.Equals(t, map[string][]sample{`{foo="bar"}`: {}}, seriesSet)
 
 	querierAfterCommit, err := db.Querier(context.Background(), 0, 1000000)
@@ -2643,10 +2675,10 @@ func TestDBQueryDoesntSeeAppendsAfterCreation(t *testing.T) {
 	defer querierAfterCommit.Close()
 
 	// Samples are returned for querier created after Commit.
-	ss, _, err = querierAfterCommit.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+	ss = querierAfterCommit.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+	_, seriesSet, ws, err = expandSeriesSet(ss)
 	testutil.Ok(t, err)
-	_, seriesSet, err = expandSeriesSet(ss)
-	testutil.Ok(t, err)
+	testutil.Equals(t, 0, len(ws))
 	testutil.Equals(t, map[string][]sample{`{foo="bar"}`: {{t: 0, v: 0}}}, seriesSet)
 }
 
@@ -2871,4 +2903,95 @@ func TestChunkReader_ConcurrentReads(t *testing.T) {
 		wg.Wait()
 	}
 	testutil.Ok(t, r.Close())
+}
+
+// TestCompactHead ensures that the head compaction
+// creates a block that is ready for loading and
+// does not cause data loss.
+// This test:
+// * opens a storage;
+// * appends values;
+// * compacts the head; and
+// * queries the db to ensure the samples are present from the compacted head.
+func TestCompactHead(t *testing.T) {
+	dbDir, err := ioutil.TempDir("", "testFlush")
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(dbDir)) }()
+
+	// Open a DB and append data to the WAL.
+	tsdbCfg := &Options{
+		RetentionDuration: int64(time.Hour * 24 * 15 / time.Millisecond),
+		NoLockfile:        true,
+		MinBlockDuration:  int64(time.Hour * 2 / time.Millisecond),
+		MaxBlockDuration:  int64(time.Hour * 2 / time.Millisecond),
+		WALCompression:    true,
+	}
+
+	db, err := Open(dbDir, log.NewNopLogger(), prometheus.NewRegistry(), tsdbCfg)
+	testutil.Ok(t, err)
+	app := db.Appender()
+	var expSamples []sample
+	maxt := 100
+	for i := 0; i < maxt; i++ {
+		val := rand.Float64()
+		_, err := app.Add(labels.FromStrings("a", "b"), int64(i), val)
+		testutil.Ok(t, err)
+		expSamples = append(expSamples, sample{int64(i), val})
+	}
+	testutil.Ok(t, app.Commit())
+
+	// Compact the Head to create a new block.
+	testutil.Ok(t, db.CompactHead(NewRangeHead(db.Head(), 0, int64(maxt)-1)))
+	testutil.Ok(t, db.Close())
+
+	// Delete everything but the new block and
+	// reopen the db to query it to ensure it includes the head data.
+	testutil.Ok(t, deleteNonBlocks(db.Dir()))
+	db, err = Open(dbDir, log.NewNopLogger(), prometheus.NewRegistry(), tsdbCfg)
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(db.Blocks()))
+	testutil.Equals(t, int64(maxt), db.Head().MinTime())
+	defer func() { testutil.Ok(t, db.Close()) }()
+	querier, err := db.Querier(context.Background(), 0, int64(maxt)-1)
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, querier.Close()) }()
+
+	seriesSet := querier.Select(false, nil, &labels.Matcher{Type: labels.MatchEqual, Name: "a", Value: "b"})
+	var actSamples []sample
+
+	for seriesSet.Next() {
+		series := seriesSet.At().Iterator()
+		for series.Next() {
+			time, val := series.At()
+			actSamples = append(actSamples, sample{int64(time), val})
+		}
+		testutil.Ok(t, series.Err())
+	}
+	testutil.Equals(t, expSamples, actSamples)
+	testutil.Ok(t, seriesSet.Err())
+}
+
+func deleteNonBlocks(dbDir string) error {
+	dirs, err := ioutil.ReadDir(dbDir)
+	if err != nil {
+		return err
+	}
+	for _, dir := range dirs {
+		if ok := isBlockDir(dir); !ok {
+			if err := os.RemoveAll(filepath.Join(dbDir, dir.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	dirs, err = ioutil.ReadDir(dbDir)
+	if err != nil {
+		return err
+	}
+	for _, dir := range dirs {
+		if ok := isBlockDir(dir); !ok {
+			return errors.Errorf("root folder:%v still hase non block directory:%v", dbDir, dir.Name())
+		}
+	}
+
+	return nil
 }

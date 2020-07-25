@@ -670,7 +670,7 @@ func (g *Group) RestoreForState(ts time.Time) {
 	// We allow restoration only if alerts were active before after certain time.
 	mint := ts.Add(-g.opts.OutageTolerance)
 	mintMS := int64(model.TimeFromUnixNano(mint.UnixNano()))
-	q, err := g.opts.TSDB.Querier(g.opts.Context, mintMS, maxtMS)
+	q, err := g.opts.Queryable.Querier(g.opts.Context, mintMS, maxtMS)
 	if err != nil {
 		level.Error(g.logger).Log("msg", "Failed to get Querier", "err", err)
 		return
@@ -707,12 +707,7 @@ func (g *Group) RestoreForState(ts time.Time) {
 				matchers = append(matchers, mt)
 			}
 
-			sset, err, _ := q.Select(false, nil, matchers...)
-			if err != nil {
-				level.Error(g.logger).Log("msg", "Failed to restore 'for' state",
-					labels.AlertName, alertRule.Name(), "stage", "Select", "err", err)
-				return
-			}
+			sset := q.Select(false, nil, matchers...)
 
 			seriesFound := false
 			var s storage.Series
@@ -725,6 +720,17 @@ func (g *Group) RestoreForState(ts time.Time) {
 					seriesFound = true
 					break
 				}
+			}
+
+			if err := sset.Err(); err != nil {
+				// Querier Warnings are ignored. We do not care unless we have an error.
+				level.Error(g.logger).Log(
+					"msg", "Failed to restore 'for' state",
+					labels.AlertName, alertRule.Name(),
+					"stage", "Select",
+					"err", err,
+				)
+				return
 			}
 
 			if !seriesFound {
@@ -840,12 +846,13 @@ type ManagerOptions struct {
 	NotifyFunc      NotifyFunc
 	Context         context.Context
 	Appendable      storage.Appendable
-	TSDB            storage.Storage
+	Queryable       storage.Queryable
 	Logger          log.Logger
 	Registerer      prometheus.Registerer
 	OutageTolerance time.Duration
 	ForGracePeriod  time.Duration
 	ResendDelay     time.Duration
+	GroupLoader     GroupLoader
 
 	Metrics *Metrics
 }
@@ -855,6 +862,10 @@ type ManagerOptions struct {
 func NewManager(o *ManagerOptions) *Manager {
 	if o.Metrics == nil {
 		o.Metrics = NewGroupMetrics(o.Registerer)
+	}
+
+	if o.GroupLoader == nil {
+		o.GroupLoader = FileLoader{}
 	}
 
 	m := &Manager{
@@ -869,8 +880,13 @@ func NewManager(o *ManagerOptions) *Manager {
 	return m
 }
 
-// Run starts processing of the rule manager.
+// Run starts processing of the rule manager. It is blocking.
 func (m *Manager) Run() {
+	m.start()
+	<-m.done
+}
+
+func (m *Manager) start() {
 	close(m.block)
 }
 
@@ -963,6 +979,22 @@ func (m *Manager) Update(interval time.Duration, files []string, externalLabels 
 	return nil
 }
 
+// GroupLoader is responsible for loading rule groups from arbitrary sources and parsing them.
+type GroupLoader interface {
+	Load(identifier string) (*rulefmt.RuleGroups, []error)
+	Parse(query string) (parser.Expr, error)
+}
+
+// FileLoader is the default GroupLoader implementation. It defers to rulefmt.ParseFile
+// and parser.ParseExpr
+type FileLoader struct{}
+
+func (FileLoader) Load(identifier string) (*rulefmt.RuleGroups, []error) {
+	return rulefmt.ParseFile(identifier)
+}
+
+func (FileLoader) Parse(query string) (parser.Expr, error) { return parser.ParseExpr(query) }
+
 // LoadGroups reads groups from a list of files.
 func (m *Manager) LoadGroups(
 	interval time.Duration, externalLabels labels.Labels, filenames ...string,
@@ -972,7 +1004,7 @@ func (m *Manager) LoadGroups(
 	shouldRestore := !m.restored
 
 	for _, fn := range filenames {
-		rgs, errs := rulefmt.ParseFile(fn)
+		rgs, errs := m.opts.GroupLoader.Load(fn)
 		if errs != nil {
 			return nil, errs
 		}
@@ -985,7 +1017,7 @@ func (m *Manager) LoadGroups(
 
 			rules := make([]Rule, 0, len(rg.Rules))
 			for _, r := range rg.Rules {
-				expr, err := parser.ParseExpr(r.Expr.Value)
+				expr, err := m.opts.GroupLoader.Parse(r.Expr.Value)
 				if err != nil {
 					return nil, []error{errors.Wrap(err, fn)}
 				}

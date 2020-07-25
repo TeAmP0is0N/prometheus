@@ -359,7 +359,7 @@ func TestForStateRestore(t *testing.T) {
 	opts := &ManagerOptions{
 		QueryFunc:       EngineQueryFunc(suite.QueryEngine(), suite.Storage()),
 		Appendable:      suite.Storage(),
-		TSDB:            suite.Storage(),
+		Queryable:       suite.Storage(),
 		Context:         context.Background(),
 		Logger:          log.NewNopLogger(),
 		NotifyFunc:      func(ctx context.Context, expr string, alerts ...*Alert) {},
@@ -524,7 +524,7 @@ func TestStaleness(t *testing.T) {
 	opts := &ManagerOptions{
 		QueryFunc:  EngineQueryFunc(engine, st),
 		Appendable: st,
-		TSDB:       st,
+		Queryable:  st,
 		Context:    context.Background(),
 		Logger:     log.NewNopLogger(),
 	}
@@ -563,9 +563,7 @@ func TestStaleness(t *testing.T) {
 	matcher, err := labels.NewMatcher(labels.MatchEqual, model.MetricNameLabel, "a_plus_one")
 	testutil.Ok(t, err)
 
-	set, _, err := querier.Select(false, nil, matcher)
-	testutil.Ok(t, err)
-
+	set := querier.Select(false, nil, matcher)
 	samples, err := readSeriesSet(set)
 	testutil.Ok(t, err)
 
@@ -686,9 +684,7 @@ func TestDeletedRuleMarkedStale(t *testing.T) {
 	matcher, err := labels.NewMatcher(labels.MatchEqual, "l1", "v1")
 	testutil.Ok(t, err)
 
-	set, _, err := querier.Select(false, nil, matcher)
-	testutil.Ok(t, err)
-
+	set := querier.Select(false, nil, matcher)
 	samples, err := readSeriesSet(set)
 	testutil.Ok(t, err)
 
@@ -715,12 +711,12 @@ func TestUpdate(t *testing.T) {
 	engine := promql.NewEngine(opts)
 	ruleManager := NewManager(&ManagerOptions{
 		Appendable: st,
-		TSDB:       st,
+		Queryable:  st,
 		QueryFunc:  EngineQueryFunc(engine, st),
 		Context:    context.Background(),
 		Logger:     log.NewNopLogger(),
 	})
-	ruleManager.Run()
+	ruleManager.start()
 	defer ruleManager.Stop()
 
 	err := ruleManager.Update(10*time.Second, files, nil)
@@ -851,7 +847,7 @@ func TestNotify(t *testing.T) {
 	opts := &ManagerOptions{
 		QueryFunc:   EngineQueryFunc(engine, storage),
 		Appendable:  storage,
-		TSDB:        storage,
+		Queryable:   storage,
 		Context:     context.Background(),
 		Logger:      log.NewNopLogger(),
 		NotifyFunc:  notifyFunc,
@@ -910,8 +906,8 @@ func TestMetricsUpdate(t *testing.T) {
 	}
 
 	storage := teststorage.New(t)
-	registry := prometheus.NewRegistry()
 	defer storage.Close()
+	registry := prometheus.NewRegistry()
 	opts := promql.EngineOpts{
 		Logger:     nil,
 		Reg:        nil,
@@ -921,13 +917,13 @@ func TestMetricsUpdate(t *testing.T) {
 	engine := promql.NewEngine(opts)
 	ruleManager := NewManager(&ManagerOptions{
 		Appendable: storage,
-		TSDB:       storage,
+		Queryable:  storage,
 		QueryFunc:  EngineQueryFunc(engine, storage),
 		Context:    context.Background(),
 		Logger:     log.NewNopLogger(),
 		Registerer: registry,
 	})
-	ruleManager.Run()
+	ruleManager.start()
 	defer ruleManager.Stop()
 
 	countMetrics := func() int {
@@ -995,13 +991,13 @@ func TestGroupStalenessOnRemoval(t *testing.T) {
 	engine := promql.NewEngine(opts)
 	ruleManager := NewManager(&ManagerOptions{
 		Appendable: storage,
-		TSDB:       storage,
+		Queryable:  storage,
 		QueryFunc:  EngineQueryFunc(engine, storage),
 		Context:    context.Background(),
 		Logger:     log.NewNopLogger(),
 	})
 	var stopped bool
-	ruleManager.Run()
+	ruleManager.start()
 	defer func() {
 		if !stopped {
 			ruleManager.Stop()
@@ -1072,13 +1068,13 @@ func TestMetricsStalenessOnManagerShutdown(t *testing.T) {
 	engine := promql.NewEngine(opts)
 	ruleManager := NewManager(&ManagerOptions{
 		Appendable: storage,
-		TSDB:       storage,
+		Queryable:  storage,
 		QueryFunc:  EngineQueryFunc(engine, storage),
 		Context:    context.Background(),
 		Logger:     log.NewNopLogger(),
 	})
 	var stopped bool
-	ruleManager.Run()
+	ruleManager.start()
 	defer func() {
 		if !stopped {
 			ruleManager.Stop()
@@ -1107,9 +1103,7 @@ func countStaleNaN(t *testing.T, st storage.Storage) int {
 	matcher, err := labels.NewMatcher(labels.MatchEqual, model.MetricNameLabel, "test_2")
 	testutil.Ok(t, err)
 
-	set, _, err := querier.Select(false, nil, matcher)
-	testutil.Ok(t, err)
-
+	set := querier.Select(false, nil, matcher)
 	samples, err := readSeriesSet(set)
 	testutil.Ok(t, err)
 
@@ -1123,4 +1117,43 @@ func countStaleNaN(t *testing.T, st storage.Storage) int {
 		}
 	}
 	return c
+}
+
+func TestGroupHasAlertingRules(t *testing.T) {
+	tests := []struct {
+		group *Group
+		want  bool
+	}{
+		{
+			group: &Group{
+				name: "HasAlertingRule",
+				rules: []Rule{
+					NewAlertingRule("alert", nil, 0, nil, nil, nil, true, nil),
+					NewRecordingRule("record", nil, nil),
+				},
+			},
+			want: true,
+		},
+		{
+			group: &Group{
+				name:  "HasNoRule",
+				rules: []Rule{},
+			},
+			want: false,
+		},
+		{
+			group: &Group{
+				name: "HasOnlyRecordingRule",
+				rules: []Rule{
+					NewRecordingRule("record", nil, nil),
+				},
+			},
+			want: false,
+		},
+	}
+
+	for i, test := range tests {
+		got := test.group.HasAlertingRules()
+		testutil.Assert(t, test.want == got, "test case %d failed, expected:%t got:%t", i, test.want, got)
+	}
 }
